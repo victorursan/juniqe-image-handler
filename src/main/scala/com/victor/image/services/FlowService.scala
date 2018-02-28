@@ -19,26 +19,28 @@ object FlowService {
     })
 
   def renderFiles(copiedFiles: Stream[Future[Either[ImageFile, (File, String)]]])(implicit ec: ExecutionContext):
-  Future[Stream[Either[ImageFile, (File, String)]]] = Future.sequence(
-    copiedFiles.map(_.flatMap {
-      case Left(imageFile: ImageFile) => Future.sequence(SKUHandler.renderFile(imageFile))
-      case Right(err) => Future(Seq(Right(err)))
-    })).map(_.flatten)
+  Stream[Future[Seq[Either[ImageFile, (File, String)]]]] = copiedFiles.map(_.flatMap {
+    case Left(imageFile: ImageFile) => Future.sequence(SKUHandler.renderFile(imageFile))
+    case Right(err) => Future(Seq(Right(err)))
 
-  def uploadToS3(renderedFiles: Future[Seq[Either[ImageFile, (File, String)]]])(implicit ec: ExecutionContext):
-  Future[Seq[Either[(File, URL), (File, String)]]] =
-    renderedFiles.flatMap { elements: Seq[Either[ImageFile, (File, String)]] =>
+  })
+
+  def uploadToS3(renderedFiles: Seq[Future[Seq[Either[ImageFile, (File, String)]]]])(implicit ec: ExecutionContext):
+  Future[Seq[Either[(File, URL), (File, String)]]] = Future.sequence(renderedFiles.map(
+    _.flatMap { elements: Seq[Either[ImageFile, (File, String)]] =>
       Future.sequence(elements.map {
         case Left(imageFile) => AmazonS3Service.uploadToS3(imageFile.file)
-        case Right(anyth) => Future(Right(anyth))
+        case Right(err) => Future(Right(err))
       })
-    }
+    })).map(_.flatten)
 
   def collectResultState(uploadedToS3: Future[Seq[Either[(File, URL), (File, String)]]])(implicit ec: ExecutionContext):
   Future[ResultState] = uploadedToS3.collect[ResultState] { case seq =>
-    val (lefts, rights) = seq.foldRight((Map[File, URL](), Map[File, String]()))(
-      (e, p: (Map[File, URL], Map[File, String])) => e.fold(
-        (l: (File, URL)) => (p._1 + (l._1 -> l._2), p._2), (r: (File, String)) => (p._1, p._2 + (r._1 -> r._2))))
-    ResultState(lefts, rights)
+    val (succeeded, failed) = seq.foldRight((Map[File, URL](), Map[File, String]())) { (either, collector) =>
+      val (succeed, fail) = collector
+      either.fold((left: (File, URL)) => (succeed + left, fail),
+        (right: (File, String)) => (succeed, fail + right))
+    }
+    ResultState(succeeded, failed)
   }
 }
